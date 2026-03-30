@@ -1,16 +1,17 @@
-# Nonin WristOx2 3150 BLE Tool
+# Nonin WristOx2 3150 Tool
 
-Command-line tool for configuring and reading data from Nonin WristOx2 3150 pulse oximeters over Bluetooth LE.
+Command-line tool for configuring and reading data from Nonin WristOx2 3150 pulse oximeters. Supports both Bluetooth LE (3150 BLE) and Bluetooth Classic/SPP (3150 Classic) variants.
 
 ## Requirements
 
 - Python 3.10+
-- Bluetooth LE adapter
-- [bleak](https://github.com/hbldh/bleak) BLE library
+- Bluetooth adapter (LE or Classic depending on device variant)
+- [bleak](https://github.com/hbldh/bleak) for BLE variant
+- [pyserial](https://github.com/pyserial/pyserial) for Classic variant (optional, only needed with --port)
 
-Tested on Linux (Ubuntu/WSL2). Should work on Windows and macOS via bleak's cross-platform support, but auto-pairing currently only implemented for Linux (other platforms rely on OS-level pairing dialogs).
+Tested on Linux (Ubuntu/WSL2). BLE should work on Windows and macOS via bleak. Classic uses Python's built-in AF_BLUETOOTH socket (Linux) or pyserial for explicit port paths.
 
-## Quick Start
+## Quick Start (BLE)
 
 1. Insert batteries into the oximeter. You have 2 minutes to pair.
 
@@ -36,69 +37,72 @@ Tested on Linux (Ubuntu/WSL2). Should work on Windows and macOS via bleak's cros
    python3 nonin_cli.py stream 08:6B:D7:13:01:E8
    ```
 
+## Quick Start (Classic/SPP)
+
+1. Pair via bluetoothctl:
+   ```
+   bluetoothctl pair 00:1C:05:XX:XX:XX
+   ```
+   Enter the 6-digit PIN from the back of the device when prompted.
+
+2. Read configuration:
+   ```
+   python3 nonin_cli.py --serial config 00:1C:05:XX:XX:XX get-config
+   ```
+
+3. Stream at 1Hz:
+   ```
+   python3 nonin_cli.py --serial stream 00:1C:05:XX:XX:XX --df df8
+   ```
+
 ## Examples
 
-### Stream SpO2 to a CSV file
+### BLE streaming
 ```
-python3 nonin_cli.py stream 08:6B:D7:13:01:E8 --csv -o readings.csv
-```
-
-### Stream all sensors at once
-```
-python3 nonin_cli.py stream 08:6B:D7:13:01:E8 --streams all
+python3 nonin_cli.py stream ADDR --csv -o readings.csv
+python3 nonin_cli.py stream ADDR --streams all
+python3 nonin_cli.py stream ADDR --format '{ts} SpO2={spo2} HR={pulse_rate}'
 ```
 
-### Custom output format
+### Classic/SPP streaming
 ```
-python3 nonin_cli.py stream 08:6B:D7:13:01:E8 --format '{ts} SpO2={spo2} HR={pulse_rate}'
-```
-
-### Download stored sessions from device memory
-```
-python3 nonin_cli.py download 08:6B:D7:13:01:E8
+python3 nonin_cli.py --serial stream ADDR --df df8            # 1 Hz
+python3 nonin_cli.py --serial stream ADDR --df df2            # 75 Hz with waveform
+python3 nonin_cli.py --serial stream ADDR --df df2 --csv -o wave.csv
 ```
 
-### Download only the 3 most recent sessions
+### Download stored sessions
 ```
-python3 nonin_cli.py download 08:6B:D7:13:01:E8 --first 3
-```
-
-### Download sessions after a specific time
-```
-python3 nonin_cli.py download 08:6B:D7:13:01:E8 --after '2010-01-01 02:00:00'
-```
-
-### Download stored data as CSV
-```
-python3 nonin_cli.py download 08:6B:D7:13:01:E8 --csv -o sessions.csv
+python3 nonin_cli.py download ADDR                            # all sessions (BLE)
+python3 nonin_cli.py download ADDR --first 3                  # 3 most recent
+python3 nonin_cli.py download ADDR --after '2026-03-30 12:00' # by date
+python3 nonin_cli.py download ADDR --csv -o sessions.csv      # as CSV
+python3 nonin_cli.py --serial download ADDR --first 3         # Classic variant
 ```
 
-### Change activation mode
+### Configuration
 ```
-python3 nonin_cli.py config 08:6B:D7:13:01:E8 set-activation bluetooth
-```
-
-### Scripting-friendly output
-```
-python3 nonin_cli.py config 08:6B:D7:13:01:E8 --raw get-activation
-# activation=0x34 name=bluetooth
-```
-
-### See all available options and what they mean
-```
-python3 nonin_cli.py config --help
+python3 nonin_cli.py config ADDR set-datetime
+python3 nonin_cli.py config ADDR set-activation bluetooth
+python3 nonin_cli.py config ADDR set-storage-rate 1s
+python3 nonin_cli.py config ADDR --raw get-config             # scripting output
+python3 nonin_cli.py config --help                            # full docs
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `scan` | Find Nonin devices (continuous, Ctrl+C to stop) |
-| `stream <addr>` | Stream live SpO2, pulse rate, PPG, pulse intervals |
+| `scan` | Find Nonin devices (BLE continuous scan, or `--serial` for serial ports) |
+| `stream <addr>` | Stream live readings |
 | `download <addr>` | Download stored sessions from device memory |
 | `config <addr> ...` | Read/write device configuration |
 
-## Available Streams
+Add `--serial` before any command to use Classic/SPP instead of BLE.
+
+## Streaming Data Formats
+
+### BLE streams (--streams)
 
 | Stream | Data | Rate |
 |--------|------|------|
@@ -107,6 +111,15 @@ python3 nonin_cli.py config --help
 | `df22` | Raw PPG waveform (25 samples) | 3/s |
 | `df23` | Device status, errors, battery % | 1/s |
 | `all` | All of the above | |
+
+### Classic/SPP data formats (--df)
+
+| Format | Data | Rate |
+|--------|------|------|
+| `df2` | SpO2, PR, 8-bit compressed waveform | 75 Hz |
+| `df7` | SpO2, PR, 16-bit full-resolution waveform | 75 Hz |
+| `df8` | SpO2, PR | 1 Hz |
+| `df13` | SpO2, PR (SmartPoint spot-check) | per measurement |
 
 ## Memory Download
 
@@ -128,9 +141,7 @@ Output formats:
 Note: timestamps depend on the device clock. Set it with
 `config <addr> set-datetime` before recording.
 
-## Security Modes
-
-The device has two security modes that control when new BLE bonds are accepted:
+## Security Modes (BLE only)
 
 | Mode | Bonding window | Notes |
 |------|---------------|-------|
@@ -138,14 +149,16 @@ The device has two security modes that control when new BLE bonds are accepted:
 | `mode1` | Any time during a connection | No battery pull needed to pair |
 
 ```
-python3 nonin_cli.py config 08:6B:D7:13:01:E8 get-security
-python3 nonin_cli.py config 08:6B:D7:13:01:E8 set-security mode1
+python3 nonin_cli.py config ADDR get-security
+python3 nonin_cli.py config ADDR set-security mode1
 ```
 
 The device stores up to 7 bonds. The 8th replaces the least recently used.
 
 ## Notes
 
-- The device must be paired before use. On first connection (Linux) the tool pairs automatically. On other platforms, accept the OS pairing prompt.
-- In security mode 2 (default), pairing requires batteries inserted within the last 2 minutes.
+- BLE: first connection auto-pairs on Linux. Other platforms show an OS pairing prompt.
+- BLE: security mode 2 (default) requires batteries inserted within the last 2 minutes to pair.
+- Classic: pair via `bluetoothctl pair ADDR` with the PIN from the device label.
+- Classic: some commands (security, bond management, turn-off-upon-disconnect) are BLE-only.
 - Run `nonin_cli.py config --help` for detailed descriptions of every setting.
