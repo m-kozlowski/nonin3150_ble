@@ -8,7 +8,7 @@ Command-line tool for configuring and reading data from Nonin WristOx2 3150 puls
 - Bluetooth LE adapter
 - [bleak](https://github.com/hbldh/bleak) BLE library
 
-Tested on Linux. Should work on Windows and macOS via bleak's cross-platform support, but auto-pairing currently only implemented for Linux (other platforms rely on OS-level pairing dialogs).
+Tested on Linux (Ubuntu/WSL2). Should work on Windows and macOS via bleak's cross-platform support, but auto-pairing currently only implemented for Linux (other platforms rely on OS-level pairing dialogs).
 
 ## Quick Start
 
@@ -26,7 +26,12 @@ Tested on Linux. Should work on Windows and macOS via bleak's cross-platform sup
    ```
    First connection will pair automatically.
 
-4. Stream live readings:
+4. Set the device clock (so stored records have correct timestamps):
+   ```
+   python3 nonin_cli.py config 08:6B:D7:13:01:E8 set-datetime
+   ```
+
+5. Stream live readings:
    ```
    python3 nonin_cli.py stream 08:6B:D7:13:01:E8
    ```
@@ -48,19 +53,29 @@ python3 nonin_cli.py stream 08:6B:D7:13:01:E8 --streams all
 python3 nonin_cli.py stream 08:6B:D7:13:01:E8 --format '{ts} SpO2={spo2} HR={pulse_rate}'
 ```
 
-### Set the device clock to now
+### Download stored sessions from device memory
 ```
-python3 nonin_cli.py config 08:6B:D7:13:01:E8 set-datetime
+python3 nonin_cli.py download 08:6B:D7:13:01:E8
+```
+
+### Download only the 3 most recent sessions
+```
+python3 nonin_cli.py download 08:6B:D7:13:01:E8 --first 3
+```
+
+### Download sessions after a specific time
+```
+python3 nonin_cli.py download 08:6B:D7:13:01:E8 --after '2010-01-01 02:00:00'
+```
+
+### Download stored data as CSV
+```
+python3 nonin_cli.py download 08:6B:D7:13:01:E8 --csv -o sessions.csv
 ```
 
 ### Change activation mode
 ```
 python3 nonin_cli.py config 08:6B:D7:13:01:E8 set-activation bluetooth
-```
-
-### Change storage rate
-```
-python3 nonin_cli.py config 08:6B:D7:13:01:E8 set-storage-rate 1s
 ```
 
 ### Scripting-friendly output
@@ -74,6 +89,15 @@ python3 nonin_cli.py config 08:6B:D7:13:01:E8 --raw get-activation
 python3 nonin_cli.py config --help
 ```
 
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `scan` | Find Nonin devices (continuous, Ctrl+C to stop) |
+| `stream <addr>` | Stream live SpO2, pulse rate, PPG, pulse intervals |
+| `download <addr>` | Download stored sessions from device memory |
+| `config <addr> ...` | Read/write device configuration |
+
 ## Available Streams
 
 | Stream | Data | Rate |
@@ -83,6 +107,26 @@ python3 nonin_cli.py config --help
 | `df22` | Raw PPG waveform (25 samples) | 3/s |
 | `df23` | Device status, errors, battery % | 1/s |
 | `all` | All of the above | |
+
+## Memory Download
+
+The device stores SpO2 and pulse rate at a configurable interval (1s/2s/4s)
+with capacity for up to ~1097 hours at 4s rate. Sessions are stored when the
+device is on and measuring.
+
+Download filters (can be combined):
+- `--first N` - only the N most recent sessions (cancels early)
+- `--skip N` - skip the N newest sessions
+- `--after TIME` - sessions starting at or after TIME (cancels early)
+- `--before TIME` - sessions starting before TIME
+
+Output formats:
+- Default: session summary with sample count, averages, min/max
+- `--csv` - one row per sample with computed timestamps
+- `--raw` - key=value headers + raw spo2,pr values
+
+Note: timestamps depend on the device clock. Set it with
+`config <addr> set-datetime` before recording.
 
 ## Security Modes
 

@@ -16,6 +16,7 @@ CONTROL_POINT_UUID = "1447AF80-0D60-11E2-88B6-0002A5D5C51B"
 DEVICE_STATUS_DF23_UUID = "EC0A9302-4D24-11E7-B114-B2F933D5FE66"
 PULSE_INTERVAL_DF20_UUID = "34E27863-76FF-4F8E-96F1-9E3993AA6199"
 PPG_DF22_UUID = "EC0A883A-4D24-11E7-B114-B2F933D5FE66"
+MEMORY_PLAYBACK_UUID = "EC0A8DDA-4D24-11E7-B114-B2F933D5FE66"
 
 
 # Lookup tables
@@ -447,6 +448,108 @@ def build_get_storage_rate_command():
     return bytes([0x60, 0x4E, 0x4D, 0x49, 0x06, 0x44, 0x53, 0x52, 0x3F, 0x0D, 0x0A])
 
 
+def build_memory_playback_command():
+    return bytes([0x71, 0x4E, 0x4D, 0x49])
+
+
+def build_cancel_memory_playback_command():
+    return bytes([0x72, 0x4E, 0x4D, 0x49])
+
+
+# Memory playback data parser
+
+SESSION_HEADER = (0xFE, 0xFD)
+SESSION_SEPARATOR = (0xFF, 0xFF)
+
+
+def _decode_memory_time(triplets: list, idx: int) -> Optional[datetime]:
+    """Decode 3 triplets into a datetime. Format: [(month,day),(year,minute),(second,hour)]."""
+    if idx + 3 > len(triplets):
+        return None
+    month_raw, day = triplets[idx]
+    year_raw, minute = triplets[idx + 1]
+    second, hour = triplets[idx + 2]
+    month = month_raw + 1  # device stores 0-indexed months
+    year = 2000 + year_raw
+    try:
+        return datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return None
+
+
+def parse_memory_data(raw: bytes) -> list:
+    """Parse raw memory playback bytes into a list of sessions.
+
+    Each session is a dict with:
+        seconds_per_sample: int
+        current_time: datetime or None
+        stop_time: datetime or None
+        start_time: datetime or None
+        samples: list of (spo2, pulse_rate) tuples
+            spo2/pr = None if invalid (255)
+            pr > 200 is decompressed: 200 + (raw - 200) * 2
+    """
+    triplets = []
+    for i in range(0, len(raw) - 2, 3):
+        b0, b1, cs = raw[i], raw[i + 1], raw[i + 2]
+        if (b0 + b1) % 256 != cs:
+            continue  # skip invalid triplets
+        triplets.append((b0, b1))
+
+    sessions = []
+    i = 0
+    while i < len(triplets):
+        # session header
+        if triplets[i] == SESSION_HEADER:
+            session = _parse_session(triplets, i)
+            if session:
+                sessions.append(session)
+                i += 11 + len(session["samples"])
+                continue
+        # skip separator
+        i += 1
+
+    return sessions
+
+
+def _parse_session(triplets: list, start: int) -> Optional[dict]:
+    """Parse a single session starting at a FE FD header triplet."""
+    if start + 11 > len(triplets):
+        return None
+
+    seconds_per_sample = triplets[start + 1][0]
+    fmt = triplets[start + 1][1]
+    current_time = _decode_memory_time(triplets, start + 2)
+    stop_time = _decode_memory_time(triplets, start + 5)
+    start_time = _decode_memory_time(triplets, start + 8)
+
+    samples = []
+    i = start + 11
+    while i < len(triplets):
+        t = triplets[i]
+        if t == SESSION_HEADER or t == SESSION_SEPARATOR:
+            break
+        pr_raw, spo2_raw = t  # byte0=pulse_rate, byte1=spo2
+        spo2 = None if spo2_raw == 255 else spo2_raw
+        if pr_raw == 255:
+            pr = None
+        elif pr_raw > 200:
+            pr = 200 + (pr_raw - 200) * 2
+        else:
+            pr = pr_raw
+        samples.append((spo2, pr))
+        i += 1
+
+    return {
+        "seconds_per_sample": seconds_per_sample,
+        "format": fmt,
+        "current_time": current_time,
+        "stop_time": stop_time,
+        "start_time": start_time,
+        "samples": samples,
+    }
+
+
 # Name resolution helpers
 
 def resolve_activation_mode(value: str) -> int:
@@ -505,6 +608,7 @@ async def scan_continuous(callback: Callable[[str, str], None]):
 class NoninClient:
     def __init__(self, address: str, timeout: float = 30.0):
         self.address = address
+        self._timeout = timeout
         self._client = BleakClient(address, timeout=timeout)
         self._control_lock = asyncio.Lock()
         self._response_event = asyncio.Event()
@@ -518,12 +622,21 @@ class NoninClient:
         }
 
     async def connect(self):
-        # Nonin requires bluez-level bonding before bleak can discover services.
-        # Check and pair upfront if needed.
         await self._ensure_paired()
-        await self._client.connect()
-        # Control point requires encrypted link; retry after connection
-        # settles and bonding completes
+        for conn_attempt in range(3):
+            device = await BleakScanner.find_device_by_address(
+                self.address, timeout=self._timeout)
+            if device is None:
+                raise RuntimeError(f"Device {self.address} not found")
+            try:
+                await self._client.connect()
+                break
+            except Exception:
+                if conn_attempt == 2:
+                    raise
+                await asyncio.sleep(5)
+                self._client = BleakClient(self.address, timeout=self._timeout)
+        # Control point requires encrypted link
         for attempt in range(3):
             try:
                 await self._client.start_notify(CONTROL_POINT_UUID, self._control_point_handler)
@@ -536,7 +649,6 @@ class NoninClient:
     async def _ensure_paired(self):
         if sys.platform == "linux":
             await self._ensure_paired_linux()
-        # On other platforms (Windows/macOS), bleak handles pairing via OS prompts
 
     async def _ensure_paired_linux(self):
         from dbus_fast.aio import MessageBus
@@ -549,7 +661,7 @@ class NoninClient:
 
         bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         try:
-            # Check if already paired
+            # already paired
             reply = await bus.call(Message(
                 destination="org.bluez",
                 path="/",
@@ -564,7 +676,6 @@ class NoninClient:
                 if paired and paired.value:
                     return
 
-            # Register a no-input pairing agent
             agent_path = "/nonin/agent"
 
             class _Agent(ServiceInterface):
@@ -590,7 +701,6 @@ class NoninClient:
             ))
 
             try:
-                # Scan until device appears with Device1 interface
                 await bus.call(Message(
                     destination="org.bluez",
                     path=adapter_path,
@@ -628,7 +738,6 @@ class NoninClient:
                         member="StopDiscovery",
                     ))
 
-                # Pair
                 print(f"Pairing with {self.address}...")
                 reply = await bus.call(Message(
                     destination="org.bluez",
@@ -636,10 +745,9 @@ class NoninClient:
                     interface="org.bluez.Device1",
                     member="Pair",
                 ))
-                if reply.message_type.value == 3:  # error
+                if reply.message_type.value == 3:
                     raise RuntimeError(f"Pairing failed: {reply.body}")
 
-                # Disconnect so bleak can connect cleanly
                 await bus.call(Message(
                     destination="org.bluez",
                     path=dev_path,
@@ -863,6 +971,114 @@ class NoninClient:
         resp = await self._send_command("TURN_OFF_UPON_DISCONNECT", build_turn_off_upon_disconnect_command())
         if not resp.get("success"):
             raise RuntimeError("TURN_OFF_UPON_DISCONNECT not acknowledged")
+
+    # Memory playback
+
+    async def download_memory(
+        self,
+        after: Optional[datetime] = None,
+        before: Optional[datetime] = None,
+        max_sessions: Optional[int] = None,
+        skip_sessions: int = 0,
+        progress_callback: Optional[Callable[[int], None]] = None,
+    ) -> list:
+        """Download stored sessions from device memory.
+
+        Sessions arrive newest-first. Filtering:
+            after:  only include sessions starting at or after this time
+            before: only include sessions starting before this time
+            max_sessions: stop after collecting this many sessions
+            skip_sessions: skip the first N sessions (newest)
+        When possible, playback is cancelled early to avoid downloading
+        the full memory.
+
+        Returns a list of session dicts, each containing:
+            seconds_per_sample, start_time, stop_time, current_time,
+            samples: [(spo2, pr), ...]
+
+        progress_callback(byte_count) is called as data arrives.
+        """
+        raw_chunks = []
+        last_receive_time = [asyncio.get_event_loop().time()]
+        cancel_requested = [False]
+
+        def on_indication(sender, data: bytearray):
+            raw_chunks.append(bytes(data))
+            last_receive_time[0] = asyncio.get_event_loop().time()
+            if progress_callback:
+                total = sum(len(c) for c in raw_chunks)
+                progress_callback(total)
+
+        await self._client.start_notify(MEMORY_PLAYBACK_UUID, on_indication)
+
+        await self._client.write_gatt_char(
+            CONTROL_POINT_UUID, build_memory_playback_command())
+
+        while True:
+            await asyncio.sleep(1)
+            elapsed = asyncio.get_event_loop().time() - last_receive_time[0]
+            if raw_chunks and elapsed > 3:
+                break
+            if not raw_chunks and elapsed > 10:
+                break
+
+            if not cancel_requested[0]:
+                raw = b"".join(raw_chunks)
+                sessions = parse_memory_data(raw)
+                should_cancel = False
+
+                # Cancel once we have enough sessions
+                if max_sessions is not None:
+                    total_needed = skip_sessions + max_sessions
+                    if len(sessions) >= total_needed:
+                        should_cancel = True
+
+                # Cancel once sessions are older than the date cutoff
+                if after:
+                    for s in sessions:
+                        if s["start_time"] and s["start_time"] < after:
+                            should_cancel = True
+                            break
+
+                if should_cancel:
+                    try:
+                        await self._client.write_gatt_char(
+                            CONTROL_POINT_UUID,
+                            build_cancel_memory_playback_command())
+                    except Exception:
+                        pass
+                    cancel_requested[0] = True
+                    await asyncio.sleep(2)
+                    break
+
+        try:
+            await self._client.stop_notify(MEMORY_PLAYBACK_UUID)
+        except Exception:
+            pass  # device may have disconnected after cancel
+
+        raw = b"".join(raw_chunks)
+        sessions = parse_memory_data(raw)
+
+        # Apply filters
+        if after or before:
+            sessions = [
+                s for s in sessions
+                if s["start_time"] is not None
+                and (not after or s["start_time"] >= after)
+                and (not before or s["start_time"] < before)
+            ]
+
+        if skip_sessions:
+            sessions = sessions[skip_sessions:]
+
+        if max_sessions is not None:
+            sessions = sessions[:max_sessions]
+
+        return sessions
+
+    async def cancel_memory_playback(self):
+        await self._client.write_gatt_char(
+            CONTROL_POINT_UUID, build_cancel_memory_playback_command())
 
     # Streaming
 

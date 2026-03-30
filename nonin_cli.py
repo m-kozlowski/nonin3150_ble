@@ -104,6 +104,100 @@ async def cmd_stream(args):
             output.close()
 
 
+async def cmd_download(args):
+    client = nonin_lib.NoninClient(args.address)
+    output = sys.stdout
+    close_output = False
+
+    if args.output:
+        output = open(args.output, "w")
+        close_output = True
+
+    after = datetime.fromisoformat(args.after) if args.after else None
+    before = datetime.fromisoformat(args.before) if args.before else None
+    max_sessions = args.first if args.first else None
+    skip_sessions = args.skip if args.skip else 0
+
+    def on_progress(byte_count):
+        print(f"\r  Received {byte_count} bytes...", end="", file=sys.stderr)
+
+    try:
+        print(f"Connecting to {args.address}...", file=sys.stderr)
+        await client.connect()
+        print("Downloading stored records...", file=sys.stderr)
+        sessions = await client.download_memory(
+            after=after, before=before,
+            max_sessions=max_sessions, skip_sessions=skip_sessions,
+            progress_callback=on_progress)
+        print(f"\n  {len(sessions)} session(s) downloaded.", file=sys.stderr)
+
+        if not sessions:
+            print("No stored sessions found.", file=sys.stderr)
+            return
+
+        if args.csv:
+            output.write("session,sample,timestamp,spo2,pulse_rate\n")
+            for si, session in enumerate(sessions):
+                interval = session["seconds_per_sample"]
+                start = session["start_time"]
+                for ji, (spo2, pr) in enumerate(session["samples"]):
+                    if start:
+                        from datetime import timedelta
+                        ts = (start + timedelta(seconds=ji * interval)).isoformat()
+                    else:
+                        ts = str(ji * interval)
+                    spo2_s = "" if spo2 is None else str(spo2)
+                    pr_s = "" if pr is None else str(pr)
+                    output.write(f"{si},{ji},{ts},{spo2_s},{pr_s}\n")
+        elif args.raw:
+            for si, session in enumerate(sessions):
+                output.write(f"session={si}\n")
+                output.write(f"seconds_per_sample={session['seconds_per_sample']}\n")
+                output.write(f"start_time={session['start_time'].isoformat() if session['start_time'] else ''}\n")
+                output.write(f"stop_time={session['stop_time'].isoformat() if session['stop_time'] else ''}\n")
+                output.write(f"samples={len(session['samples'])}\n")
+                for spo2, pr in session["samples"]:
+                    spo2_s = "" if spo2 is None else str(spo2)
+                    pr_s = "" if pr is None else str(pr)
+                    output.write(f"{spo2_s},{pr_s}\n")
+                output.write("\n")
+        else:
+            for si, session in enumerate(sessions):
+                start = session["start_time"]
+                stop = session["stop_time"]
+                n = len(session["samples"])
+                interval = session["seconds_per_sample"]
+                start_s = start.strftime("%Y-%m-%d %H:%M:%S") if start else "unknown"
+                stop_s = stop.strftime("%Y-%m-%d %H:%M:%S") if stop else "unknown"
+
+                valid = [(s, p) for s, p in session["samples"] if s is not None]
+                if valid:
+                    spo2_vals = [s for s, _ in valid]
+                    pr_vals = [p for _, p in valid if p is not None]
+                    spo2_avg = sum(spo2_vals) / len(spo2_vals)
+                    pr_avg = sum(pr_vals) / len(pr_vals) if pr_vals else 0
+                    spo2_min = min(spo2_vals)
+                    spo2_max = max(spo2_vals)
+                else:
+                    spo2_avg = spo2_min = spo2_max = pr_avg = 0
+
+                print(f"Session {si + 1}:")
+                print(f"  Start:    {start_s}")
+                print(f"  Stop:     {stop_s}")
+                print(f"  Interval: {interval}s")
+                print(f"  Samples:  {n}")
+                if valid:
+                    print(f"  SpO2:     avg={spo2_avg:.0f} min={spo2_min} max={spo2_max}")
+                    print(f"  PR:       avg={pr_avg:.0f}")
+                print()
+
+        output.flush()
+    finally:
+        await client.disconnect()
+        if close_output:
+            output.close()
+
+
 async def cmd_config(args):
     client = nonin_lib.NoninClient(args.address)
     try:
@@ -390,6 +484,33 @@ def build_parser():
     p_stream.add_argument("-o", "--output", default=None,
                           help="Write to file instead of stdout")
 
+    # download
+    p_dl = sub.add_parser("download",
+                           help="Download stored sessions from device memory",
+                           formatter_class=argparse.RawDescriptionHelpFormatter,
+                           epilog="""\
+output formats:
+  default     Session summary with averages and min/max
+  --csv       CSV: session,sample,timestamp,spo2,pulse_rate
+  --raw       Key=value headers + raw spo2,pr per line
+
+Sessions are returned newest first. Timestamps are based on the
+device clock (set with: config <addr> set-datetime).
+""")
+    p_dl.add_argument("address", help="Device MAC address")
+    p_dl.add_argument("--after", default=None,
+                       help="Only sessions starting at or after this time (ISO format). "
+                            "Cancels download early once older sessions are reached.")
+    p_dl.add_argument("--before", default=None,
+                       help="Only sessions starting before this time (ISO format)")
+    p_dl.add_argument("--first", type=int, default=None,
+                       help="Download only the N most recent sessions, then cancel")
+    p_dl.add_argument("--skip", type=int, default=0,
+                       help="Skip the first N sessions (newest)")
+    p_dl.add_argument("--csv", action="store_true", help="Output as CSV")
+    p_dl.add_argument("--raw", action="store_true", help="Raw key=value output")
+    p_dl.add_argument("-o", "--output", default=None, help="Write to file instead of stdout")
+
     # config
     p_cfg = sub.add_parser("config",
                            help="Read/write device configuration",
@@ -491,6 +612,8 @@ def main():
             asyncio.run(cmd_scan(args))
         elif args.command == "stream":
             asyncio.run(cmd_stream(args))
+        elif args.command == "download":
+            asyncio.run(cmd_download(args))
         elif args.command == "config":
             asyncio.run(cmd_config(args))
     except KeyboardInterrupt:
