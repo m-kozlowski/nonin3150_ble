@@ -5,7 +5,9 @@ import json
 import sys
 from datetime import datetime
 
-import nonin_lib
+import nonin_lib.common as nonin_lib
+import nonin_lib.ble as nonin_ble
+import nonin_lib.ssp as nonin_serial
 
 
 # Output formatters
@@ -52,6 +54,15 @@ def _flatten(data: dict, prefix: str = "") -> dict:
 # CLI commands
 
 async def cmd_scan(args):
+    if args.serial:
+        ports = nonin_serial.scan_serial()
+        if not ports:
+            print("No serial ports found.")
+        else:
+            for p in ports:
+                print(f"  {p['port']}  ({p['description']})")
+        return
+
     seen = set()
 
     def on_found(address, name):
@@ -59,13 +70,12 @@ async def cmd_scan(args):
             seen.add(address)
             print(f"  {address}  {name}")
 
-    print("Scanning for Nonin devices... (Ctrl+C to stop)")
-    await nonin_lib.scan_continuous(on_found)
+    print("Scanning for Nonin BLE devices... (Ctrl+C to stop)")
+    await nonin_ble.scan_continuous(on_found)
     print(f"\n{len(seen)} device(s) found.")
 
 
 async def cmd_stream(args):
-    streams = [s.strip() for s in args.streams.split(",")]
     output = sys.stdout
     close_output = False
 
@@ -88,24 +98,38 @@ async def cmd_stream(args):
         output.write(line + "\n")
         output.flush()
 
-    client = nonin_lib.NoninClient(args.address)
     try:
-        print(f"Connecting to {args.address}...", file=sys.stderr)
-        await client.connect()
-        print("Connected. Streaming... (Ctrl+C to stop)", file=sys.stderr)
-        await client.subscribe(streams, on_data)
-        while client.is_connected:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        pass
+        if args.serial:
+            client = nonin_serial.NoninSerial(port=args.port, address=args.address)
+            client.connect()
+            print(f"Connected. Streaming {args.df}... (Ctrl+C to stop)", file=sys.stderr)
+            df = nonin_lib.resolve_data_format(args.df)
+            try:
+                client.stream(df, on_data)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                client.disconnect()
+        else:
+            streams = [s.strip() for s in args.streams.split(",")]
+            client = nonin_ble.NoninBLE(args.address)
+            print(f"Connecting to {args.address}...", file=sys.stderr)
+            await client.connect()
+            print("Connected. Streaming... (Ctrl+C to stop)", file=sys.stderr)
+            await client.subscribe(streams, on_data)
+            try:
+                while client.is_connected:
+                    await asyncio.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                await client.disconnect()
     finally:
-        await client.disconnect()
         if close_output:
             output.close()
 
 
 async def cmd_download(args):
-    client = nonin_lib.NoninClient(args.address)
     output = sys.stdout
     close_output = False
 
@@ -122,14 +146,27 @@ async def cmd_download(args):
         print(f"\r  Received {byte_count} bytes...", end="", file=sys.stderr)
 
     try:
-        print(f"Connecting to {args.address}...", file=sys.stderr)
-        await client.connect()
-        print("Downloading stored records...", file=sys.stderr)
-        sessions = await client.download_memory(
-            after=after, before=before,
-            max_sessions=max_sessions, skip_sessions=skip_sessions,
-            progress_callback=on_progress)
-        print(f"\n  {len(sessions)} session(s) downloaded.", file=sys.stderr)
+        if args.serial:
+            client = nonin_serial.NoninSerial(port=args.port, address=args.address)
+            client.connect()
+            print("Downloading stored records...", file=sys.stderr)
+            sessions = client.download_memory(
+                after=after, before=before,
+                max_sessions=max_sessions, skip_sessions=skip_sessions,
+                progress_callback=on_progress)
+            print(f"\n  {len(sessions)} session(s) downloaded.", file=sys.stderr)
+            client.disconnect()
+        else:
+            client = nonin_ble.NoninBLE(args.address)
+            print(f"Connecting to {args.address}...", file=sys.stderr)
+            await client.connect()
+            print("Downloading stored records...", file=sys.stderr)
+            sessions = await client.download_memory(
+                after=after, before=before,
+                max_sessions=max_sessions, skip_sessions=skip_sessions,
+                progress_callback=on_progress)
+            print(f"\n  {len(sessions)} session(s) downloaded.", file=sys.stderr)
+            await client.disconnect()
 
         if not sessions:
             print("No stored sessions found.", file=sys.stderr)
@@ -193,24 +230,48 @@ async def cmd_download(args):
 
         output.flush()
     finally:
-        await client.disconnect()
         if close_output:
             output.close()
 
 
 async def cmd_config(args):
-    client = nonin_lib.NoninClient(args.address)
-    try:
-        await client.connect()
-        await args.config_func(client, args)
-    finally:
-        await client.disconnect()
+    if args.serial:
+        if args.action in BLE_ONLY_COMMANDS:
+            print(f"Error: '{args.action}' is only available over BLE, not serial.", file=sys.stderr)
+            return
+        client = nonin_serial.NoninSerial(port=args.port, address=args.address)
+        try:
+            client.connect()
+            result = args.config_func(client, args)
+            if asyncio.iscoroutine(result):
+                await result
+        finally:
+            client.disconnect()
+    else:
+        client = nonin_ble.NoninBLE(args.address)
+        try:
+            await client.connect()
+            await args.config_func(client, args)
+        finally:
+            await client.disconnect()
 
 
 # Config sub-handlers
+# These use `await` on client methods. For BLE, methods are async coroutines.
+# For serial, methods return plain values. We use _call() to handle both.
+
+async def _call(method, *args, **kwargs):
+    result = method(*args, **kwargs)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
+
+BLE_ONLY_COMMANDS = {
+    "get-security", "set-security", "delete-bond", "turn-off-upon-disconnect",
+}
 
 async def cfg_get_datetime(client, args):
-    dt = await client.get_datetime()
+    dt = await _call(client.get_datetime)
     if args.raw:
         print(f"datetime={dt.isoformat()}")
     else:
@@ -222,7 +283,7 @@ async def cfg_set_datetime(client, args):
         dt = datetime.fromisoformat(args.time)
     else:
         dt = datetime.now()
-    await client.set_datetime(dt)
+    await _call(client.set_datetime, dt)
     if args.raw:
         print(f"datetime={dt.isoformat()}")
     else:
@@ -230,7 +291,7 @@ async def cfg_set_datetime(client, args):
 
 
 async def cfg_get_activation(client, args):
-    mode, name = await client.get_activation_mode()
+    mode, name = await _call(client.get_activation_mode)
     if args.raw:
         print(f"activation=0x{mode:02X} name={name}")
     else:
@@ -240,7 +301,7 @@ async def cfg_get_activation(client, args):
 
 async def cfg_set_activation(client, args):
     mode = nonin_lib.resolve_activation_mode(args.mode)
-    await client.set_activation_mode(mode)
+    await _call(client.set_activation_mode, mode)
     name = nonin_lib.ACTIVATION_MODES.get(mode, "?")
     if args.raw:
         print(f"activation=0x{mode:02X} name={name}")
@@ -250,7 +311,7 @@ async def cfg_set_activation(client, args):
 
 
 async def cfg_get_display(client, args):
-    mode, name = await client.get_display_mode()
+    mode, name = await _call(client.get_display_mode)
     if args.raw:
         print(f"display=0x{mode:02X} name={name}")
     else:
@@ -260,7 +321,7 @@ async def cfg_get_display(client, args):
 
 async def cfg_set_display(client, args):
     mode = nonin_lib.resolve_display_mode(args.mode)
-    await client.set_display_mode(mode)
+    await _call(client.set_display_mode, mode)
     name = nonin_lib.DISPLAY_MODES.get(mode, "?")
     if args.raw:
         print(f"display=0x{mode:02X} name={name}")
@@ -270,7 +331,7 @@ async def cfg_set_display(client, args):
 
 
 async def cfg_get_storage_rate(client, args):
-    rate, name = await client.get_storage_rate()
+    rate, name = await _call(client.get_storage_rate)
     if args.raw:
         print(f"storage_rate=0x{rate:02X} name={name}")
     else:
@@ -280,7 +341,7 @@ async def cfg_get_storage_rate(client, args):
 
 async def cfg_set_storage_rate(client, args):
     rate = nonin_lib.resolve_storage_rate(args.rate)
-    await client.set_storage_rate(rate)
+    await _call(client.set_storage_rate, rate)
     name = nonin_lib.STORAGE_RATES.get(rate, "?")
     if args.raw:
         print(f"storage_rate=0x{rate:02X} name={name}")
@@ -290,7 +351,7 @@ async def cfg_set_storage_rate(client, args):
 
 
 async def cfg_get_device_id(client, args):
-    text = await client.get_device_id()
+    text = await _call(client.get_device_id)
     if args.raw:
         print(f"device_id={text}")
     elif text:
@@ -300,7 +361,7 @@ async def cfg_get_device_id(client, args):
 
 
 async def cfg_set_device_id(client, args):
-    await client.set_device_id(args.text)
+    await _call(client.set_device_id, args.text)
     if args.raw:
         print(f"device_id={args.text}")
     else:
@@ -308,7 +369,7 @@ async def cfg_set_device_id(client, args):
 
 
 async def cfg_get_security(client, args):
-    mode, name = await client.get_security_mode()
+    mode, name = await _call(client.get_security_mode)
     if args.raw:
         print(f"security=0x{mode:02X} name={name}")
     else:
@@ -318,7 +379,7 @@ async def cfg_get_security(client, args):
 
 async def cfg_set_security(client, args):
     mode = nonin_lib.resolve_security_mode(args.mode)
-    await client.set_security_mode(mode)
+    await _call(client.set_security_mode, mode)
     name = nonin_lib.SECURITY_MODES.get(mode, "?")
     if args.raw:
         print(f"security=0x{mode:02X} name={name}")
@@ -328,9 +389,11 @@ async def cfg_set_security(client, args):
 
 
 async def cfg_get_config(client, args):
-    cfg = await client.get_config()
+    cfg = await _call(client.get_config)
     if args.raw:
         for k, v in cfg.items():
+            if k.startswith("_"):
+                continue
             print(f"{k}={v}")
         return
 
@@ -364,7 +427,7 @@ async def cfg_get_config(client, args):
 
 
 async def cfg_set_config(client, args):
-    await client.set_config(
+    await _call(client.set_config,
         activation_option=nonin_lib.resolve_activation_mode(args.activation),
         storage_rate=nonin_lib.resolve_storage_rate(args.storage_rate),
         display_option=nonin_lib.resolve_display_mode(args.display),
@@ -382,17 +445,17 @@ async def cfg_set_config(client, args):
 async def cfg_delete_bond(client, args):
     op = nonin_lib.resolve_delete_bond_op(args.operation)
     name = nonin_lib.DELETE_BOND_OPS.get(op, f"0x{op:02X}")
-    await client.delete_bond(op)
+    await _call(client.delete_bond, op)
     print(f"Bond(s) deleted ({name}).")
 
 
 async def cfg_clear_memory(client, args):
-    await client.clear_memory()
+    await _call(client.clear_memory)
     print("Device memory cleared.")
 
 
 async def cfg_turn_off_upon_disconnect(client, args):
-    await client.turn_off_upon_disconnect()
+    await _call(client.turn_off_upon_disconnect)
     print("Turn-off-upon-disconnect enabled.")
     print("  (only effective in Bluetooth Connection activation mode)")
 
@@ -460,14 +523,19 @@ all values also accept hex (e.g. 0x31)
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="nonin_cli",
-        description="Nonin WristOx2 3150 BLE command-line tool",
+        description="Nonin WristOx2 3150 BLE/Classic command-line tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--serial", action="store_true",
+                        help="Use serial/SPP transport instead of BLE")
+    parser.add_argument("--port", default=None,
+                        help="Serial port path (e.g. /dev/rfcomm0). "
+                             "If not given, auto-binds rfcomm from the device address.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # scan
     sub.add_parser("scan",
-                    help="Scan for Nonin BLE devices (continuous, Ctrl+C to stop)")
+                    help="Scan for devices (BLE by default, serial ports with --serial)")
 
     # stream
     p_stream = sub.add_parser("stream",
@@ -476,7 +544,10 @@ def build_parser():
                               formatter_class=argparse.RawDescriptionHelpFormatter)
     p_stream.add_argument("address", help="Device MAC address")
     p_stream.add_argument("--streams", default="oximetry",
-                          help="Comma-separated list (default: oximetry)")
+                          help="BLE: comma-separated list (default: oximetry)")
+    p_stream.add_argument("--df", default="df8",
+                          help="Serial: data format - df2 (75Hz), df7 (75Hz 16-bit), "
+                               "df8 (1Hz), df13 (spot-check). Default: df8")
     p_stream.add_argument("--format", dest="format", default=None,
                           help="Python format string, e.g. '{spo2},{pulse_rate}'")
     p_stream.add_argument("--csv", action="store_true",
@@ -618,6 +689,9 @@ def main():
             asyncio.run(cmd_config(args))
     except KeyboardInterrupt:
         pass
+    except (OSError, RuntimeError, TimeoutError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
