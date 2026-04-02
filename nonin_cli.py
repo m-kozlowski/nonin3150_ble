@@ -2,6 +2,8 @@
 import argparse
 import asyncio
 import json
+import socket
+import struct
 import sys
 from datetime import datetime
 
@@ -10,33 +12,7 @@ import nonin_lib.ble as nonin_ble
 import nonin_lib.ssp as nonin_serial
 
 
-# Output formatters
-
-def format_kv(stream: str, data: dict) -> str:
-    ts = datetime.now().isoformat(timespec="milliseconds")
-    parts = [f"ts={ts}", f"stream={stream}"]
-    for k, v in _flatten(data).items():
-        parts.append(f"{k}={v}")
-    return " ".join(parts)
-
-
-def format_csv_header(stream: str, data: dict) -> str:
-    fields = ["ts", "stream"] + list(_flatten(data).keys())
-    return ",".join(fields)
-
-
-def format_csv(stream: str, data: dict) -> str:
-    ts = datetime.now().isoformat(timespec="milliseconds")
-    values = [ts, stream] + [str(v) for v in _flatten(data).values()]
-    return ",".join(values)
-
-
-def format_custom(fmt: str, stream: str, data: dict) -> str:
-    flat = _flatten(data)
-    flat["ts"] = datetime.now().isoformat(timespec="milliseconds")
-    flat["stream"] = stream
-    return fmt.format(**flat)
-
+# Output sinks and formatters
 
 def _flatten(data: dict, prefix: str = "") -> dict:
     out = {}
@@ -49,6 +25,254 @@ def _flatten(data: dict, prefix: str = "") -> dict:
         else:
             out[key] = v
     return out
+
+
+def _extract_spo2_pr(stream: str, data: dict) -> tuple:
+    if "spo2" in data or "pulse_rate" in data:
+        return data.get("spo2"), data.get("pulse_rate")
+    # Raw DF2/DF7 field names
+    if stream in ("df2", "df7"):
+        return data.get("spo2_display"), data.get("pr_display")
+    return None, None
+
+
+UDP_OXI_MAGIC = b"\x55\xAB"
+UDP_OXI_INVALID = 0x07FF
+
+PREDEFINED_FORMATS = {"kv", "csv", "airbridge"}
+
+
+class OutputSink:
+    """Manages output destination (stdout, file, or UDP) and formatting."""
+
+    def __init__(self, output_spec: str = None, fmt: str = "kv"):
+        self._fmt = fmt
+        self._udp_sock = None
+        self._udp_dest = None
+        self._file = None
+        self._close_file = False
+        self._csv_header_printed = {}
+
+        if output_spec and output_spec.startswith("udp:"):
+            rest = output_spec[4:]
+            host, _, port = rest.rpartition(":")
+            if not host:
+                host = "127.0.0.1"
+            # Resolve hostname once at init
+            infos = socket.getaddrinfo(host, int(port), type=socket.SOCK_DGRAM)
+            if not infos:
+                raise RuntimeError(f"Cannot resolve {host}")
+            af, socktype, proto, _, addr = infos[0]
+            self._udp_dest = addr
+            self._udp_sock = socket.socket(af, socktype, proto)
+        elif output_spec:
+            self._file = open(output_spec, "wb" if fmt == "airbridge" else "w")
+            self._close_file = True
+        else:
+            self._file = sys.stdout
+
+    def write(self, stream: str, data: dict):
+        if self._fmt == "airbridge":
+            spo2, pr = _extract_spo2_pr(stream, data)
+            if spo2 is None:
+                spo2 = UDP_OXI_INVALID
+            if pr is None:
+                pr = UDP_OXI_INVALID
+            packet = UDP_OXI_MAGIC + b"\x00" + struct.pack("<HH", spo2, pr)
+            if self._udp_sock:
+                self._udp_sock.sendto(packet, self._udp_dest)
+            elif self._file:
+                if hasattr(self._file, "buffer"):
+                    self._file.buffer.write(packet)
+                    self._file.buffer.flush()
+                else:
+                    self._file.write(packet)
+                    self._file.flush()
+            return
+
+        # Text formats
+        if self._fmt == "csv":
+            if stream not in self._csv_header_printed:
+                header = ",".join(["ts", "stream"] + list(_flatten(data).keys()))
+                self._send_text(header)
+                self._csv_header_printed[stream] = True
+            ts = datetime.now().isoformat(timespec="milliseconds")
+            values = [ts, stream] + [str(v) for v in _flatten(data).values()]
+            line = ",".join(values)
+        elif self._fmt == "kv":
+            ts = datetime.now().isoformat(timespec="milliseconds")
+            parts = [f"ts={ts}", f"stream={stream}"]
+            for k, v in _flatten(data).items():
+                parts.append(f"{k}={v}")
+            line = " ".join(parts)
+        else:
+            # custom python format string
+            flat = _flatten(data)
+            flat["ts"] = datetime.now().isoformat(timespec="milliseconds")
+            flat["stream"] = stream
+            line = self._fmt.format(**flat)
+
+        self._send_text(line)
+
+    def _send_text(self, line: str):
+        if self._udp_sock:
+            self._udp_sock.sendto(line.encode() + b"\n", self._udp_dest)
+        elif self._file:
+            self._file.write(line + "\n")
+            self._file.flush()
+
+    def close(self):
+        if self._udp_sock:
+            self._udp_sock.close()
+        if self._close_file and self._file:
+            self._file.close()
+
+
+# Stream transforms
+
+class PassthroughTransform:
+
+    def __init__(self, callback):
+        self._callback = callback
+
+    def __call__(self, stream: str, data: dict):
+        self._callback(stream, data)
+
+
+class CollectTransform:
+    """Accumulates fields across DF2/DF7 frames, emits merged records.
+
+    DF2/DF7 spread SpO2, PR, and status across a 25-frame cycle.
+    This transform collects specified fields and emits one record
+    per cycle with stable field names.
+
+    fields: list of field names to collect. Each maps to specific
+            frame IDs in the DF2/DF7 cycle. Default: spo2, pulse_rate.
+    """
+
+    # Map from output field name to (frame_id, source_key) pairs (1-based)
+    DF2_FIELD_MAP = {
+        "spo2": [(3, "spo2")],
+        "pulse_rate": [(1, "hr_msb"), (2, "hr_lsb")],
+        "spo2_display": [(9, "spo2_display")],
+        "spo2_fast": [(10, "spo2_fast")],
+        "spo2_b2b": [(11, "spo2_b2b")],
+        "e_spo2": [(16, "e_spo2")],
+        "pulse_rate_ext": [(14, "e_hr_msb"), (15, "e_hr_lsb")],
+        "pulse_rate_display": [(20, "hr_d_msb"), (21, "hr_d_lsb")],
+        "low_battery": [(8, "low_battery")],
+        "smartpoint": [(8, "smartpoint")],
+    }
+
+    def __init__(self, callback, fields=None):
+        self._callback = callback
+        self._fields = fields or ["spo2", "pulse_rate"]
+        self._acc = {}
+        self._last_frame_id = -1
+
+    def __call__(self, stream: str, data: dict):
+        frame_id = data.get("frame_id")
+        if frame_id is None:
+            # Non-DF2 data (oximetry, df8, df13) - pass through
+            self._callback(stream, data)
+            return
+
+        # Detect cycle boundary (sync bit resets frame_id to 1)
+        if frame_id == 1 and self._last_frame_id > 1 and self._acc:
+            self._emit(stream, data)
+
+        self._last_frame_id = frame_id
+
+        # Accumulate fields from this frame
+        for field in self._fields:
+            mappings = self.DF2_FIELD_MAP.get(field, [])
+            for fid, src_key in mappings:
+                if frame_id == fid and src_key in data:
+                    self._acc[src_key] = data[src_key]
+
+        # Always track pleth for waveform
+        if "pleth" in data:
+            self._acc["pleth"] = data["pleth"]
+
+    def _emit(self, stream: str, data: dict):
+        record = {}
+
+        for field in self._fields:
+            mappings = self.DF2_FIELD_MAP.get(field, [])
+            if len(mappings) == 2 and mappings[0][1].endswith("_msb"):
+                # Reconstruct 9-bit HR from MSB + LSB
+                # HR format: MSB byte has HR8 in bit 0, LSB byte has HR6..HR0
+                msb_key = mappings[0][1]
+                lsb_key = mappings[1][1]
+                msb = self._acc.get(msb_key)
+                lsb = self._acc.get(lsb_key)
+                if lsb is not None:
+                    hr = ((msb & 0x01) << 7 | (lsb & 0x7F)) if msb is not None else (lsb & 0x7F)
+                    record[field] = None if hr == 511 else hr
+            else:
+                # Single-value fields
+                src_key = mappings[0][1] if mappings else field
+                val = self._acc.get(src_key)
+                if val is not None:
+                    record[field] = val
+
+        self._acc.clear()
+
+        if record:
+            self._callback(stream, record)
+
+
+class ThrottleTransform:
+    """Rate-limits output to N emissions per second."""
+
+    def __init__(self, callback, hz: float):
+        self._callback = callback
+        self._interval = 1.0 / hz
+        self._last_emit = 0
+
+    def __call__(self, stream: str, data: dict):
+        import time
+        now = time.monotonic()
+        if now - self._last_emit >= self._interval:
+            self._callback(stream, data)
+            self._last_emit = now
+
+
+def parse_transform(spec: str, callback):
+    """Parse a --transform spec string into a transform instance.
+
+    Formats:
+        passthrough              - no-op (default)
+        collect                  - collect spo2,pulse_rate from DF2 frames
+        collect:spo2,pulse_rate,low_battery  - collect specified fields
+        throttle:N               - limit to N Hz
+        collect|throttle:3       - chain: collect then throttle to 3Hz
+    """
+    if not spec or spec == "passthrough":
+        return PassthroughTransform(callback)
+
+    # Parse chain (pipe-separated)
+    parts = spec.split("|")
+    # Build chain right-to-left: last transform wraps callback,
+    # each preceding one wraps the next
+    chain = callback
+    for part in reversed(parts):
+        part = part.strip()
+        if part == "passthrough":
+            chain = PassthroughTransform(chain)
+        elif part.startswith("collect"):
+            if ":" in part:
+                fields = part.split(":", 1)[1].split(",")
+            else:
+                fields = None
+            chain = CollectTransform(chain, fields=fields)
+        elif part.startswith("throttle:"):
+            hz = float(part.split(":", 1)[1])
+            chain = ThrottleTransform(chain, hz)
+        else:
+            raise ValueError(f"Unknown transform: {part}")
+
+    return chain
 
 
 # CLI commands
@@ -76,27 +300,11 @@ async def cmd_scan(args):
 
 
 async def cmd_stream(args):
-    output = sys.stdout
-    close_output = False
-
-    if args.output:
-        output = open(args.output, "w")
-        close_output = True
-
-    csv_header_printed = {}
+    sink = OutputSink(args.output, args.format)
+    transform = parse_transform(args.transform, sink.write)
 
     def on_data(stream: str, data: dict):
-        if args.format:
-            line = format_custom(args.format, stream, data)
-        elif args.csv:
-            if stream not in csv_header_printed:
-                output.write(format_csv_header(stream, data) + "\n")
-                csv_header_printed[stream] = True
-            line = format_csv(stream, data)
-        else:
-            line = format_kv(stream, data)
-        output.write(line + "\n")
-        output.flush()
+        transform(stream, data)
 
     try:
         if args.serial:
@@ -125,8 +333,7 @@ async def cmd_stream(args):
             finally:
                 await client.disconnect()
     finally:
-        if close_output:
-            output.close()
+        sink.close()
 
 
 async def cmd_download(args):
@@ -463,12 +670,38 @@ async def cfg_turn_off_upon_disconnect(client, args):
 # Argument parser
 
 EPILOG_STREAM = """\
-output formats:
-  default     key=value pairs: ts=... stream=oximetry spo2=98 pulse_rate=72 ...
-  --csv       CSV with auto-printed header row
-  --format    Python format string with field substitution
+output formats (--format):
+  kv          key=value pairs (default): ts=... spo2=98 pulse_rate=72 ...
+  csv         CSV with auto-printed header row
+  airbridge   7-byte binary UDP oximetry protocol (for use with -o udp:...)
+  '{...}'     custom Python format string, e.g. '{spo2},{pulse_rate}'
 
-available streams:
+output sinks (-o):
+  (default)         stdout
+  path/to/file      write to file
+  udp:host:port     send to UDP endpoint, e.g. -o udp:127.0.0.1:8025
+
+transforms (--transform / -t):
+  passthrough              every packet as-is (default)
+  collect                  merge DF2 25-frame cycle into one record (3Hz)
+                           default fields: spo2, pulse_rate
+  collect:spo2,pulse_rate,low_battery   collect specific fields
+  throttle:N               drop packets to limit output to N Hz
+  collect|throttle:3       chain: collect then throttle
+
+  collect fields: spo2, pulse_rate, spo2_display, spo2_fast, spo2_b2b,
+                  e_spo2, pulse_rate_ext, pulse_rate_display,
+                  low_battery, smartpoint
+
+examples:
+  stream ADDR                                      # kv to stdout
+  stream ADDR -f csv -o data.csv                   # csv to file
+  stream ADDR -f airbridge -o udp:127.0.0.1:8025   # airbridge to UDP
+  stream ADDR -f csv -o udp:10.0.0.1:9000          # csv lines over UDP
+  --serial stream ADDR --df df2 -t collect -f airbridge -o udp:...:8025
+  --serial stream ADDR --df df2 -t 'collect:spo2,pulse_rate,smartpoint'
+
+BLE streams (--streams):
   oximetry    SpO2, pulse rate, PAI, battery (1/s)
   df20        Pulse interval timing, up to 6 pulses/packet
   df22        Raw PPG waveform, 25 samples/packet (75 Hz)
@@ -548,12 +781,18 @@ def build_parser():
     p_stream.add_argument("--df", default="df8",
                           help="Serial: data format - df2 (75Hz), df7 (75Hz 16-bit), "
                                "df8 (1Hz), df13 (spot-check). Default: df8")
-    p_stream.add_argument("--format", dest="format", default=None,
-                          help="Python format string, e.g. '{spo2},{pulse_rate}'")
-    p_stream.add_argument("--csv", action="store_true",
-                          help="Output as CSV with header")
+    p_stream.add_argument("--format", "-f", dest="format", default="kv",
+                          help="Output format: kv (default), csv, airbridge, "
+                               "or a Python format string (e.g. '{spo2},{pulse_rate}')")
     p_stream.add_argument("-o", "--output", default=None,
-                          help="Write to file instead of stdout")
+                          help="Output sink: file path, or udp:host:port. "
+                               "Default: stdout")
+    p_stream.add_argument("--transform", "-t", default="passthrough",
+                          help="Data transform pipeline. "
+                               "passthrough (default), "
+                               "collect[:field1,field2,...], "
+                               "throttle:N (Hz). "
+                               "Chain with |, e.g. 'collect|throttle:3'")
 
     # download
     p_dl = sub.add_parser("download",

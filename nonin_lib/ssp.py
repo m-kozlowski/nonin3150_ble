@@ -373,6 +373,14 @@ class NoninSerial:
 
         stream_name, parser, packet_size = parser_map[data_format]
 
+        # DF2: byte 1 = 0x01 (start byte). DF7/DF8: byte 1 = STATUS (bit 7 set).
+        if data_format == 0x02:
+            sync_val = 0x01
+            sync_mask = 0xFF
+        else:
+            sync_val = 0x80
+            sync_mask = 0x80
+
         synced = False
 
         while self._serial.is_open:
@@ -380,20 +388,20 @@ class NoninSerial:
                 b = self._serial.read(1)
                 if not b:
                     continue
-                if b[0] & 0x80:
+                if b[0] & sync_mask == sync_val:
                     rest = self._serial.read(packet_size - 1)
                     if len(rest) == packet_size - 1:
-                        data = bytes([b[0]]) + rest
-                        parsed = parser(data)
+                        frame = bytes([b[0]]) + rest
+                        parsed = parser(frame)
                         if parsed:
                             callback(stream_name, parsed)
-                        synced = True
+                            synced = True
                 continue
 
             data = self._serial.read(packet_size)
             if len(data) < packet_size:
                 continue
-            if not (data[0] & 0x80):
+            if data[0] & sync_mask != sync_val:
                 synced = False
                 continue
             parsed = parser(data)
