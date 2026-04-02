@@ -59,16 +59,22 @@ Tested on Linux (Ubuntu/WSL2). BLE should work on Windows and macOS via bleak. C
 
 ### BLE streaming
 ```
-python3 nonin_cli.py stream ADDR --csv -o readings.csv
+python3 nonin_cli.py stream ADDR -f csv -o readings.csv
 python3 nonin_cli.py stream ADDR --streams all
-python3 nonin_cli.py stream ADDR --format '{ts} SpO2={spo2} HR={pulse_rate}'
+python3 nonin_cli.py stream ADDR -f '{ts} SpO2={spo2} HR={pulse_rate}'
 ```
 
 ### Classic/SPP streaming
 ```
 python3 nonin_cli.py --serial stream ADDR --df df8            # 1 Hz
 python3 nonin_cli.py --serial stream ADDR --df df2            # 75 Hz with waveform
-python3 nonin_cli.py --serial stream ADDR --df df2 --csv -o wave.csv
+python3 nonin_cli.py --serial stream ADDR --df df2 -f csv -o wave.csv
+```
+
+### UDP output (airbridge protocol)
+```
+python3 nonin_cli.py stream ADDR -f airbridge -o udp:127.0.0.1:8025
+python3 nonin_cli.py --serial stream ADDR --df df2 -t collect -f airbridge -o udp:...:8025
 ```
 
 ### Download stored sessions
@@ -120,6 +126,13 @@ Add `--serial` before any command to use Classic/SPP instead of BLE.
 | `df7` | SpO2, PR, 16-bit full-resolution waveform | 75 Hz |
 | `df8` | SpO2, PR | 1 Hz |
 | `df13` | SpO2, PR (SmartPoint spot-check) | per measurement |
+
+### Output formats, sinks, and transforms
+
+Stream output is configurable via `--format` (kv, csv, airbridge, or custom format string),
+`-o` (stdout, file, or `udp:host:port`), and `--transform` (collect, throttle).
+
+See [docs/streaming.md](docs/streaming.md) for details.
 
 ## Memory Download
 
