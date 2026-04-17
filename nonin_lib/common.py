@@ -461,10 +461,9 @@ def _decode_memory_time(triplets: list, idx: int) -> Optional[datetime]:
     """Decode 3 triplets into a datetime. Format: [(month,day),(year,minute),(second,hour)]."""
     if idx + 3 > len(triplets):
         return None
-    month_raw, day = triplets[idx]
+    month, day = triplets[idx]
     year_raw, minute = triplets[idx + 1]
     second, hour = triplets[idx + 2]
-    month = month_raw + 1  # device stores 0-indexed months
     year = 2000 + year_raw
     try:
         return datetime(year, month, day, hour, minute, second)
