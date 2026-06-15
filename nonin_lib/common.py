@@ -454,7 +454,6 @@ def build_cancel_memory_playback_command():
 # Memory playback data parser
 
 SESSION_HEADER = (0xFE, 0xFD)
-SESSION_SEPARATOR = (0xFF, 0xFF)
 
 
 def _decode_memory_time(triplets: list, idx: int) -> Optional[datetime]:
@@ -490,40 +489,47 @@ def parse_memory_data(raw: bytes) -> list:
             continue  # skip invalid triplets
         triplets.append((b0, b1))
 
-    sessions = []
-    i = 0
-    while i < len(triplets):
-        # session header
-        if triplets[i] == SESSION_HEADER:
-            session = _parse_session(triplets, i)
-            if session:
-                sessions.append(session)
-                i += 11 + len(session["samples"])
-                continue
-        # skip separator
-        i += 1
+    # Locate session headers: the FE FD marker followed by "current time" block.
+    headers = [
+        j for j in range(len(triplets) - 10)
+        if triplets[j] == SESSION_HEADER
+        and _decode_memory_time(triplets, j + 2) is not None
+    ]
 
+    sessions = []
+    for n, start in enumerate(headers):
+        boundary = headers[n + 1] if n + 1 < len(headers) else len(triplets)
+        sessions.append(_parse_session(triplets, start, boundary))
     return sessions
 
 
-def _parse_session(triplets: list, start: int) -> Optional[dict]:
-    """Parse a single session starting at a FE FD header triplet."""
-    if start + 11 > len(triplets):
-        return None
+def _parse_session(triplets: list, start: int, boundary: int) -> dict:
+    """Parse one session: an 11-triplet header followed by its samples.
 
+    The header records the start/stop time and sampling interval, so the sample
+    count is exactly (stop - start) / interval + 1.
+    """
     seconds_per_sample = triplets[start + 1][0]
     fmt = triplets[start + 1][1]
     current_time = _decode_memory_time(triplets, start + 2)
     stop_time = _decode_memory_time(triplets, start + 5)
     start_time = _decode_memory_time(triplets, start + 8)
 
+    sample_start = start + 11
+    count = boundary - sample_start
+
+    # Prefer the exact count implied by the header's time span
+    # fall back to the next-header boundary when the timestamps are unusable
+    if (start_time and stop_time and seconds_per_sample
+            and stop_time >= start_time):
+        span = int(round(
+            (stop_time - start_time).total_seconds() / seconds_per_sample)) + 1
+        if 0 <= span <= count:
+            count = span
+
     samples = []
-    i = start + 11
-    while i < len(triplets):
-        t = triplets[i]
-        if t == SESSION_HEADER or t == SESSION_SEPARATOR:
-            break
-        pr_raw, spo2_raw = t  # byte0=pulse_rate, byte1=spo2
+    for k in range(sample_start, sample_start + count):
+        pr_raw, spo2_raw = triplets[k]  # byte0=pulse_rate, byte1=spo2
         spo2 = None if spo2_raw == 255 else spo2_raw
         if pr_raw == 255:
             pr = None
@@ -532,7 +538,6 @@ def _parse_session(triplets: list, start: int) -> Optional[dict]:
         else:
             pr = pr_raw
         samples.append((spo2, pr))
-        i += 1
 
     return {
         "seconds_per_sample": seconds_per_sample,
